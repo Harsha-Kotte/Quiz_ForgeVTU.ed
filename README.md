@@ -1,18 +1,17 @@
-# QuizForge(VTU SPECIFIC)
+# QuizForge — PDF-grounded learning assistant
 
-**Turn your study PDFs into focused, source-grounded quizzes.**
+QuizForge turns text-based study PDFs into focused quizzes using retrieval-augmented generation (RAG). Upload notes, select a learning style, enter a topic, and generate questions based on retrieved passages.
 
-QuizForge is a Retrieval-Augmented Generation (RAG) learning assistant. Upload a text-based PDF, choose a quiz style, enter a topic, and generate questions grounded in the uploaded material.
-
-> This project is an evolving prototype, not a replacement for official course material or instructor feedback.
+> This is an evolving VTU-focused engineering project prototype. Generated questions and page references should be checked against the original PDF.
 
 ## Features
 
-- Extracts PDF text locally with pypdf.
-- Splits text into overlapping chunks and creates embeddings with Sentence Transformers.
-- Retrieves semantically relevant chunks using ChromaDB.
-- Sends retrieved context to the Groq API and streams generated quizzes into Streamlit.
-- Includes four styles: VTU exam, technical interview, beginner-friendly tutor, and cyberpunk challenge.
+- Extracts text page-by-page with pypdf and preserves original 1-based PDF page numbers.
+- Splits each page independently so chunks retain their source page.
+- Creates local embeddings with Sentence Transformers and retrieves passages with ChromaDB.
+- Filters weak semantic matches using a configurable cosine-distance threshold.
+- Adds explicit PDF page labels to retrieved context and asks each quiz style to cite supporting pages per question.
+- Streams quiz generation through Streamlit using Groq.
 
 ## Architecture
 
@@ -20,97 +19,65 @@ QuizForge is a Retrieval-Augmented Generation (RAG) learning assistant. Upload a
 PDF upload
    |
    v
-PDF text extraction
+Validate PDF -> Extract text per original page
    |
    v
-Chunking + local sentence embeddings
+Split each page into chunks + page metadata
    |
    v
-ChromaDB vector retrieval <--- Topic query
-   |
-   v
-Prompt style + retrieved context
-   |
-   v
-Groq LLM (streaming)
-   |
-   v
-Quiz displayed in Streamlit
+Local sentence embeddings -> ChromaDB (cosine distance)
+   ^                         |
+   |                         v
+Topic query ----------> Relevance filter
+                             |
+                             v
+                  Context with PDF page labels
+                             |
+                             v
+                    Groq prompt + quiz
+                             |
+                             v
+                 Questions with page references
 ```
 
-**Privacy note:** PDF extraction, chunking, and embeddings run locally in the app process. Retrieved text is sent to Groq when a quiz is generated. Do not upload confidential documents unless you are comfortable with that data flow and the provider's terms.
+## Setup
 
-## Quick start
-
-### Requirements
-
-- Python 3.10 or newer
-- A Groq API key
-- Internet access for the embedding model's first download and Groq inference
-- CPU is supported; GPU is not required
-
-### Install
+Requires Python 3.10+, a Groq API key, and internet access for the initial embedding-model download and Groq inference.
 
 ```bash
 git clone https://github.com/Harsha-Kotte/rag_quiz.git
 cd rag_quiz/quiz-rag-app
-
 python -m venv .venv
-# Windows:
-.venv\Scripts\activate
-# macOS / Linux:
-source .venv/bin/activate
-
+# Windows: .venv\\Scripts\\activate
+# macOS/Linux: source .venv/bin/activate
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### Configure your API key
-
-Create a file named `.env` next to `app.py` and add:
+Create a `.env` file next to `app.py`:
 
 ```dotenv
 GROQ_API_KEY=your_groq_api_key_here
 ```
 
-Never commit your real API key. The repository includes an `.env.example` template.
-
-### Run
-
-From the `quiz-rag-app` directory:
+Never commit a real API key. Start the app from `quiz-rag-app`:
 
 ```bash
 streamlit run app.py
 ```
 
-Open the local URL printed by Streamlit, upload a text-based PDF, choose a style, enter a topic, and generate a quiz.
+## Retrieval safeguards and limits
 
-## Current limitations
+- Uploads must have a PDF header, contain extractable text, and be no larger than 25 MB.
+- PDFs above 500 pages are rejected. Password-protected PDFs that cannot be opened without a password are rejected.
+- Scanned/image-only PDFs are not supported because OCR is not implemented.
+- Each indexed chunk stores `chunk_index` and the original `page_number`.
+- ChromaDB uses cosine distance. Matches above `QUIZFORGE_MAX_COSINE_DISTANCE` are omitted; the default is `0.65`. This is a starting threshold, not a universal relevance guarantee. Tune it against a labelled evaluation set before making accuracy claims.
+- Retrieved chunks are labelled with their source page. Prompts require each question to cite supporting pages, but LLM-generated citations are not independently verified yet. Always check them against the PDF.
+- The vector collection is in memory and is rebuilt when a new PDF is ingested. Only one active document is supported per app process.
+- Extracted passages sent to Groq are subject to the provider's data handling terms. Do not upload confidential material unless permitted.
 
-- Scanned/image-only PDFs are not supported; OCR is not included.
-- The vector collection is held in memory and rebuilt when a new PDF is ingested. It does not survive an app-process restart.
-- Page references identify the PDF page from which retrieved text came; they are source pointers, not formal academic citations.
-- LLM output can contain mistakes. Verify important information against the original notes.
-- This prototype supports one active document per running app session.
-
-## Project structure
-
-```text
-rag_quiz/
-├── README.md
-├── .gitignore
-├── .env.example
-├── tests/
-│   └── test_prompt_styles.py
-└── quiz-rag-app/
-    ├── app.py
-    ├── rag_engine.py
-    ├── quiz_generator.py
-    ├── prompt_styles.py
-    ├── requirements.txt
-    └── assets/
-        └── style.css
-```
+To adjust the cosine-distance cutoff, set `QUIZFORGE_MAX_COSINE_DISTANCE` in the environment before starting Streamlit. Lower values are stricter.
 
 ## Tests
 
@@ -120,23 +87,37 @@ From the repository root:
 python -m pytest
 ```
 
-The initial unit tests cover prompt-style registration and prompt construction. RAG integration tests will be added as the pipeline is expanded.
+The unit tests cover prompt-style construction and source metadata, context formatting, and basic PDF upload validation. The full app still needs a local integration run with the project dependencies and a Groq API key.
+
+## Repository layout
+
+```text
+rag_quiz/
+├── README.md
+├── tests/
+│   ├── test_prompt_styles.py
+│   └── test_rag_helpers.py
+└── quiz-rag-app/
+    ├── app.py
+    ├── rag_engine.py
+    ├── rag_helpers.py
+    ├── quiz_generator.py
+    ├── prompt_styles.py
+    ├── requirements.txt
+    └── assets/style.css
+```
 
 ## Roadmap
 
 - [x] PDF ingestion and semantic retrieval
-- [x] Multiple quiz-generation styles
-- [ ] Display source references alongside generated questions
-- [ ] Difficulty and question-count controls
-- [ ] Answer submission, evaluation, and explanations
-- [ ] Topic-wise performance tracking and revision recommendations
-- [ ] Persistent document indexing and multi-document workspaces
-- [ ] OCR support for scanned notes
-- [ ] Evaluation dataset for retrieval relevance and quiz faithfulness
-
-## Contributing
-
-Issues and pull requests are welcome. Please include reproduction steps for bugs and tests for new behaviour.
+- [x] Preserve original PDF page numbers in chunk metadata
+- [x] Add cosine-distance relevance filtering
+- [x] Include page labels in retrieved context
+- [x] Request page references per quiz question
+- [ ] Verify generated citations against retrieved page IDs
+- [ ] Add a labelled retrieval evaluation dataset and tune thresholds empirically
+- [ ] Answer evaluation and learner progress tracking
+- [ ] Persistent indexing, multi-document workspaces, and OCR
 
 ## Built with
 
