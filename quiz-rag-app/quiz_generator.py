@@ -200,6 +200,7 @@ def generate_quiz(
     display_name: str,
     topic: str,
     top_k: int = RETRIEVAL_TOP_K,
+    context: str | None = None,
 ) -> Iterator[str]:
     """
     Full RAG-to-quiz pipeline, exposed as a streaming generator.
@@ -243,7 +244,8 @@ def generate_quiz(
 
     # ── Step 2: retrieve context from ChromaDB ─────────────────────────────
     log.info("Retrieving context for topic: '%s'", topic[:80])
-    context = retrieve_context(query=topic, top_k=top_k)
+    if context is None:
+        context = retrieve_context(query=topic, top_k=top_k)
 
     if not context.strip():
         raise RuntimeError(

@@ -1,30 +1,19 @@
 """
-rag_engine.py
-─────────────────────────────────────────────────────────────────────────────
-Responsibilities:
-  1. Parse a PDF file into raw text (page-by-page).
-  2. Recursively split the text into overlapping chunks.
-  3. Initialise the local HuggingFace sentence-transformer embedding model
-     once and reuse it across calls (module-level singleton).
-  4. Store document chunks + embeddings in an in-memory ChromaDB collection.
-  5. Expose a retrieval function that returns the top-k most relevant chunks
-     for a given query — used by quiz_generator.py at generation time.
+Source-aware PDF ingestion and semantic retrieval for QuizForge.
 
-Design goals
-  • CPU-safe: no CUDA requirement; batch size kept small to limit RAM spikes.
-  • Stateless between Streamlit re-runs: the collection is rebuilt whenever a
-    new PDF is uploaded (call `ingest_pdf` again; the old collection is wiped).
-  • Zero disk I/O for the vector store: EphemeralClient keeps everything in RAM.
-─────────────────────────────────────────────────────────────────────────────
+Page numbers are preserved from the original PDF (1-based). The vector store
+is intentionally ephemeral and is rebuilt when a new document is ingested.
 """
 
 from __future__ import annotations
 
 import gc
+import io
 import logging
+import os
 import uuid
 from pathlib import Path
-from typing import List, Tuple
+from typing import List
 
 import chromadb
 from chromadb.config import Settings
@@ -32,214 +21,159 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 
-# ── Logging ────────────────────────────────────────────────────────────────────
+from rag_helpers import (
+    DEFAULT_MAX_COSINE_DISTANCE,
+    MAX_PDF_PAGES,
+    build_page_chunks,
+    format_retrieved_context,
+    validate_pdf_bytes,
+)
+
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 log = logging.getLogger(__name__)
 
-# ── Constants ──────────────────────────────────────────────────────────────────
-EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"   # ~22 MB, CPU-friendly
-COLLECTION_NAME      = "student_notes"
-CHUNK_SIZE           = 512                   # characters per chunk
-CHUNK_OVERLAP        = 64                    # overlap to preserve context
-EMBED_BATCH_SIZE     = 16                    # small batches → lower peak RAM
-TOP_K_DEFAULT        = 6                     # chunks returned per query
+EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+COLLECTION_NAME = "student_notes"
+CHUNK_SIZE = 512
+CHUNK_OVERLAP = 64
+EMBED_BATCH_SIZE = 16
+TOP_K_DEFAULT = 6
+MAX_COSINE_DISTANCE = float(
+    os.getenv("QUIZFORGE_MAX_COSINE_DISTANCE", str(DEFAULT_MAX_COSINE_DISTANCE))
+)
 
-# ── Module-level singletons (initialised once per Python process) ──────────────
 _embedding_model: SentenceTransformer | None = None
-_chroma_client:   chromadb.EphemeralClient  | None = None
-_collection:      chromadb.Collection       | None = None
+_chroma_client: chromadb.EphemeralClient | None = None
+_collection: chromadb.Collection | None = None
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Internal helpers
-# ══════════════════════════════════════════════════════════════════════════════
 
 def _get_embedding_model() -> SentenceTransformer:
-    """
-    Lazy-load the sentence-transformer model exactly once.
-    `device='cpu'` is explicit so the model never tries to allocate GPU memory.
-    """
     global _embedding_model
     if _embedding_model is None:
-        log.info("Loading embedding model '%s' on CPU …", EMBEDDING_MODEL_NAME)
-        _embedding_model = SentenceTransformer(
-            EMBEDDING_MODEL_NAME,
-            device="cpu",
-        )
-        log.info("Embedding model loaded.")
+        log.info("Loading embedding model '%s' on CPU", EMBEDDING_MODEL_NAME)
+        _embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device="cpu")
     return _embedding_model
 
 
 def _get_chroma_client() -> chromadb.EphemeralClient:
-    """Return a module-level in-memory ChromaDB client (no disk writes)."""
     global _chroma_client
     if _chroma_client is None:
         _chroma_client = chromadb.EphemeralClient(
             settings=Settings(anonymized_telemetry=False)
         )
-        log.info("ChromaDB EphemeralClient initialised.")
     return _chroma_client
 
 
 def _reset_collection() -> chromadb.Collection:
-    """
-    Drop and recreate the collection so repeated PDF uploads start fresh.
-    Returns the new, empty collection.
-    """
     global _collection
     client = _get_chroma_client()
-
-    # Delete if it already exists from a previous upload
-    existing = [c.name for c in client.list_collections()]
-    if COLLECTION_NAME in existing:
+    if COLLECTION_NAME in [item.name for item in client.list_collections()]:
         client.delete_collection(COLLECTION_NAME)
-        log.info("Dropped existing ChromaDB collection '%s'.", COLLECTION_NAME)
-
     _collection = client.create_collection(
-        name=COLLECTION_NAME,
-        metadata={"hnsw:space": "cosine"},   # cosine distance for sentence embeddings
+        name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"}
     )
-    log.info("Created fresh ChromaDB collection '%s'.", COLLECTION_NAME)
     return _collection
 
 
 def _get_collection() -> chromadb.Collection:
-    """Return the active collection (must call ingest_pdf first)."""
     if _collection is None:
-        raise RuntimeError(
-            "No ChromaDB collection found. Call `ingest_pdf()` before querying."
-        )
+        raise RuntimeError("No document is indexed. Call ingest_pdf() first.")
     return _collection
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Step 1 – PDF → raw text
-# ══════════════════════════════════════════════════════════════════════════════
+def parse_pdf_pages(pdf_source: str | Path | bytes) -> list[tuple[int, str]]:
+    """Extract non-empty page text as (original 1-based page number, text)."""
+    if isinstance(pdf_source, (str, Path)):
+        pdf_bytes = Path(pdf_source).read_bytes()
+    elif isinstance(pdf_source, bytes):
+        pdf_bytes = pdf_source
+    else:
+        raise TypeError("PDF source must be a file path or bytes.")
+
+    validate_pdf_bytes(pdf_bytes)
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes), strict=False)
+        if reader.is_encrypted:
+            try:
+                decrypted = reader.decrypt("")
+            except Exception as exc:
+                raise ValueError("This PDF is password-protected and cannot be read.") from exc
+            if not decrypted:
+                raise ValueError("This PDF is password-protected and cannot be read.")
+        if len(reader.pages) > MAX_PDF_PAGES:
+            raise ValueError(f"PDF has too many pages. Maximum supported is {MAX_PDF_PAGES}.")
+        pages: list[tuple[int, str]] = []
+        for page_number, page in enumerate(reader.pages, start=1):
+            text = (page.extract_text() or "").encode(
+                "utf-8", errors="ignore"
+            ).decode("utf-8").strip()
+            if text:
+                pages.append((page_number, text))
+        return pages
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError("Could not read this PDF. It may be damaged or unsupported.") from exc
+
 
 def parse_pdf(pdf_source: str | Path | bytes) -> str:
-    """
-    Extract and concatenate all text from a PDF.
-
-    Args:
-        pdf_source: A file path (str/Path) *or* raw bytes (from
-                    Streamlit's `st.file_uploader`).
-
-    Returns:
-        A single string containing the full document text.
-    """
-    import io
-    
-    if isinstance(pdf_source, (str, Path)):
-        # If it's a file path, open it explicitly in 'rb' (read binary) mode
-        with open(str(pdf_source), "rb") as f:
-            reader = PdfReader(f)
-            pages = [page.extract_text() or "" for page in reader.pages]
-    else:
-        # If it's raw bytes from Streamlit, wrap it cleanly in BytesIO
-        # Ensure we pass an open binary stream directly into PdfReader
-        pdf_stream = io.BytesIO(pdf_source)
-        reader = PdfReader(pdf_stream)
-        pages = [page.extract_text() or "" for page in reader.pages]
-
-    cleaned_pages: List[str] = []
-    for i, page_text in enumerate(pages):
-        # Prevent stray encoding characters from breaking the downstream loop
-        text = page_text.encode("utf-8", errors="ignore").decode("utf-8")
-        text = text.strip()
-        if text:
-            cleaned_pages.append(text)
-        else:
-            log.debug("Page %d yielded no extractable text — skipped.", i + 1)
-
-    full_text = "\n\n".join(cleaned_pages)
-    log.info("Parsed %d page(s), total length %d chars.", len(cleaned_pages), len(full_text))
-    return full_text
+    """Backward-compatible convenience function returning all extracted text."""
+    return "\n\n".join(text for _, text in parse_pdf_pages(pdf_source))
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Step 2 – text → chunks
-# ══════════════════════════════════════════════════════════════════════════════
-
-def split_text(text: str) -> List[str]:
-    """
-    Recursively split `text` into overlapping chunks.
-
-    RecursiveCharacterTextSplitter tries to break on paragraph boundaries
-    first, then sentences, then words — producing semantically coherent chunks
-    rather than hard-cutting mid-sentence.
-    """
-    splitter = RecursiveCharacterTextSplitter(
+def _make_splitter() -> RecursiveCharacterTextSplitter:
+    return RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
-        separators=["\n\n", "\n", ". ", " ", ""],  # priority order
+        separators=["\n\n", "\n", ". ", " ", ""],
         length_function=len,
     )
-    chunks = splitter.split_text(text)
-    log.info("Split into %d chunks (size=%d, overlap=%d).",
-             len(chunks), CHUNK_SIZE, CHUNK_OVERLAP)
-    return chunks
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Step 3 & 4 – embed chunks + store in ChromaDB
-# ══════════════════════════════════════════════════════════════════════════════
+def split_pages(pages: list[tuple[int, str]]) -> tuple[list[str], list[dict[str, int]]]:
+    chunks, metadatas = build_page_chunks(pages, _make_splitter())
+    log.info("Split %d page(s) into %d source-aware chunks.", len(pages), len(chunks))
+    return chunks, metadatas
+
+
+def split_text(text: str) -> List[str]:
+    """Legacy helper retained for callers that only need plain text chunks."""
+    return _make_splitter().split_text(text)
+
 
 def _embed_in_batches(texts: List[str]) -> List[List[float]]:
-    """
-    Embed `texts` in small batches to keep peak RAM low on CPU.
-
-    SentenceTransformer.encode() with `show_progress_bar=False` and a small
-    `batch_size` avoids loading all activations at once.
-
-    Returns:
-        A list of embedding vectors (one per input text).
-    """
     model = _get_embedding_model()
-    all_embeddings: List[List[float]] = []
-
+    embeddings: List[List[float]] = []
     for start in range(0, len(texts), EMBED_BATCH_SIZE):
-        batch = texts[start : start + EMBED_BATCH_SIZE]
-        vecs = model.encode(
-            batch,
+        vectors = model.encode(
+            texts[start : start + EMBED_BATCH_SIZE],
             batch_size=EMBED_BATCH_SIZE,
             show_progress_bar=False,
-            convert_to_numpy=True,   # numpy → list conversion is fast
-            normalize_embeddings=True,  # unit-norm; pairs well with cosine distance
+            convert_to_numpy=True,
+            normalize_embeddings=True,
         )
-        all_embeddings.extend(vecs.tolist())
-
-        # Encourage GC between batches to reclaim intermediate tensors
+        embeddings.extend(vectors.tolist())
         gc.collect()
-
-        log.debug(
-            "Embedded batch %d–%d / %d",
-            start + 1,
-            min(start + EMBED_BATCH_SIZE, len(texts)),
-            len(texts),
-        )
-
-    return all_embeddings
+    return embeddings
 
 
-def store_chunks(chunks: List[str]) -> int:
-    """
-    Embed `chunks` and upsert them into a fresh ChromaDB collection.
+def store_chunks(
+    chunks: List[str], metadatas: list[dict[str, int]] | None = None
+) -> int:
+    if not chunks:
+        raise ValueError("No readable text chunks were found in this PDF.")
+    if metadatas is None:
+        metadatas = [
+            {"chunk_index": index, "page_number": 1}
+            for index in range(len(chunks))
+        ]
+    if len(chunks) != len(metadatas):
+        raise ValueError("Each chunk must have exactly one metadata record.")
 
-    Returns:
-        The number of chunks stored.
-    """
     collection = _reset_collection()
-    model      = _get_embedding_model()   # ensure model is warm before timing
-
-    log.info("Embedding %d chunks …", len(chunks))
     embeddings = _embed_in_batches(chunks)
-
-    # ChromaDB expects parallel lists: ids, embeddings, documents
-    ids       = [str(uuid.uuid4()) for _ in chunks]
-    metadatas = [{"chunk_index": i} for i in range(len(chunks))]
-
     collection.add(
-        ids=ids,
+        ids=[str(uuid.uuid4()) for _ in chunks],
         embeddings=embeddings,
         documents=chunks,
         metadatas=metadatas,
@@ -248,92 +182,66 @@ def store_chunks(chunks: List[str]) -> int:
     return len(chunks)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Public API – ingest pipeline
-# ══════════════════════════════════════════════════════════════════════════════
-
 def ingest_pdf(pdf_source: str | Path | bytes) -> int:
-    """
-    Full pipeline: parse → split → embed → store.
-
-    Call this once per uploaded PDF.  Calling it again with a new PDF
-    automatically wipes the previous collection.
-
-    Args:
-        pdf_source: File path or raw bytes from Streamlit's file uploader.
-
-    Returns:
-        Number of chunks ingested.
-    """
-    raw_text = parse_pdf(pdf_source)
-    if not raw_text.strip():
+    """Validate, extract page-by-page, chunk, embed, and index a PDF."""
+    pages = parse_pdf_pages(pdf_source)
+    if not pages:
         raise ValueError(
-            "The uploaded PDF contains no extractable text. "
-            "Scanned/image-only PDFs are not supported without OCR."
+            "The PDF contains no extractable text. Scanned/image-only PDFs need OCR, "
+            "which is not supported yet."
         )
-
-    chunks = split_text(raw_text)
-    n      = store_chunks(chunks)
-    return n
+    chunks, metadatas = split_pages(pages)
+    return store_chunks(chunks, metadatas)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Public API – retrieval
-# ══════════════════════════════════════════════════════════════════════════════
+def retrieve_context(
+    query: str, top_k: int = TOP_K_DEFAULT, return_sources: bool = False
+) -> str | tuple[str, list[int]]:
+    """Return only sufficiently relevant chunks, each labelled with its PDF page."""
+    if not query or not query.strip():
+        raise ValueError("Retrieval query cannot be empty.")
+    if not isinstance(top_k, int) or top_k < 1:
+        raise ValueError("top_k must be a positive integer.")
 
-def retrieve_context(query: str, top_k: int = TOP_K_DEFAULT) -> str:
-    """
-    Embed `query` and return the top-k most relevant chunks as a single string.
+    collection = _get_collection()
+    count = collection.count()
+    if count == 0:
+        return ("", []) if return_sources else ""
 
-    This is the function called by quiz_generator.py to build the prompt
-    context before sending it to the Groq API.
-
-    Args:
-        query:  A natural-language description of the topic(s) to quiz on.
-        top_k:  Number of chunks to retrieve.
-
-    Returns:
-        Concatenated chunk texts separated by double newlines.
-    """
-    collection  = _get_collection()
-    model       = _get_embedding_model()
-
-    query_vec = model.encode(
-        [query],
+    model = _get_embedding_model()
+    query_vector = model.encode(
+        [query.strip()],
         show_progress_bar=False,
         convert_to_numpy=True,
         normalize_embeddings=True,
     ).tolist()
-
     results = collection.query(
-        query_embeddings=query_vec,
-        n_results=min(top_k, collection.count()),  # guard if fewer chunks exist
-        include=["documents"],
+        query_embeddings=query_vector,
+        n_results=min(top_k, count),
+        include=["documents", "metadatas", "distances"],
     )
 
-    docs: List[str] = results["documents"][0]   # list of chunk strings
-    context = "\n\n".join(docs)
-    log.info("Retrieved %d chunks for query: '%s …'", len(docs), query[:60])
-    return context
+    documents = (results.get("documents") or [[]])[0]
+    metadatas = (results.get("metadatas") or [[]])[0]
+    distances = (results.get("distances") or [[]])[0]
+    context, source_pages = format_retrieved_context(
+        documents, metadatas, distances, MAX_COSINE_DISTANCE
+    )
+    log.info(
+        "Accepted %d relevant chunks from pages %s for query '%s'",
+        len(source_pages), source_pages, query[:60]
+    )
+    if not context:
+        log.info("No chunks passed cosine-distance threshold %.3f.", MAX_COSINE_DISTANCE)
+    return (context, source_pages) if return_sources else context
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Quick sanity-check (run directly: python rag_engine.py <path/to/test.pdf>)
-# ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 2:
-        print("Usage: python rag_engine.py <path/to/notes.pdf>")
-        sys.exit(1)
-
-    pdf_path = sys.argv[1]
-    print(f"\n── Ingesting '{pdf_path}' ──")
-    total = ingest_pdf(pdf_path)
-    print(f"✓ Ingested {total} chunks.\n")
-
-    test_query = "Explain the main concepts covered in these notes."
-    print(f"── Sample retrieval for: '{test_query}' ──")
-    ctx = retrieve_context(test_query, top_k=3)
-    print(ctx[:800], "\n… (truncated)")
+        print("Usage: python rag_engine.py <path/to/test.pdf>")
+        raise SystemExit(1)
+    total = ingest_pdf(sys.argv[1])
+    print(f"Ingested {total} source-aware chunks.")
+    print(retrieve_context("Summarise the main concepts.", top_k=3))
