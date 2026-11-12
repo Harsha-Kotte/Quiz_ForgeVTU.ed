@@ -19,5 +19,8 @@ numpy>=1.26.4
 
 # ── Core Machine Learning (CPU Optimized Inline Fetch) ─────────────────────────
 sentence-transformers==3.0.1
-torch --extra-index-url https://download.pytorch.org/whl/cpu
-torchvision --extra-index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+
+# Tests
+pytest>=8.0
