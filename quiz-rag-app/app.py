@@ -92,7 +92,7 @@ else:
                     quiz_stream = quiz_generator.generate_quiz(
                         display_name=selected_style_name,
                         topic=topic.strip(),
-                            context=context,
+                        context=context,
                     )
                     st.write_stream(quiz_stream)
             except Exception as exc:
