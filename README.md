@@ -1,4 +1,4 @@
-# QuizForge
+# QuizForge(VTU SPECIFIC)
 
 **Turn your study PDFs into focused, source-grounded quizzes.**
 
