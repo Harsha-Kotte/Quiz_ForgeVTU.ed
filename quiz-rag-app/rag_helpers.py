@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Iterable, Sequence
 
 MAX_PDF_BYTES = 25 * 1024 * 1024
@@ -65,3 +66,64 @@ def format_retrieved_context(
         return "", []
 
     return "\n\n---\n\n".join(accepted), sorted(source_pages)
+
+
+_QUESTION_HEADER_RE = re.compile(
+    r"(?im)^\\s*(?:[-*]\\s*)?(?:\\*{0,2})(Q\\s*\\d+\\b|\\[CHALLENGE[_ -]\\d+\\])"
+)
+_SOURCE_CITATION_RE = re.compile(
+    r"\\bSource:\\s*PDF\\s+page(?:\\(s\\)|s)?\\s*([0-9]+(?:\\s*,\\s*[0-9]+)*)\\s*\\.?",
+    re.IGNORECASE,
+)
+
+
+def validate_source_citations(
+    generated_text: str, allowed_pages: Iterable[int]
+) -> dict[str, object]:
+    """Check that detected questions cite pages included in retrieved evidence.
+
+    This validates citation presence and page membership only. It cannot prove
+    that a cited passage semantically supports the generated question.
+    """
+    if not isinstance(generated_text, str):
+        raise TypeError("generated_text must be a string.")
+
+    allowed = {int(page) for page in allowed_pages}
+    question_matches = list(_QUESTION_HEADER_RE.finditer(generated_text))
+    uncited_questions: list[str] = []
+    cited_pages: set[int] = set()
+    unknown_pages: set[int] = set()
+
+    for index, question in enumerate(question_matches):
+        block_end = (
+            question_matches[index + 1].start()
+            if index + 1 < len(question_matches)
+            else len(generated_text)
+        )
+        question_block = generated_text[question.start() : block_end]
+        citations = list(_SOURCE_CITATION_RE.finditer(question_block))
+        label = question.group(1).strip()
+
+        if not citations:
+            uncited_questions.append(label)
+
+        for citation in citations:
+            pages = [int(value) for value in re.findall(r"\\d+", citation.group(1))]
+            cited_pages.update(pages)
+            unknown_pages.update(page for page in pages if page not in allowed)
+
+    # Still collect page membership when the output uses an unrecognised
+    # question heading, but report that per-question coverage was not checked.
+    if not question_matches:
+        for citation in _SOURCE_CITATION_RE.finditer(generated_text):
+            pages = [int(value) for value in re.findall(r"\\d+", citation.group(1))]
+            cited_pages.update(pages)
+            unknown_pages.update(page for page in pages if page not in allowed)
+
+    return {
+        "question_count": len(question_matches),
+        "uncited_questions": uncited_questions,
+        "cited_pages": sorted(cited_pages),
+        "unknown_pages": sorted(unknown_pages),
+        "question_format_detected": bool(question_matches),
+    }
